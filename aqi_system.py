@@ -1,3 +1,7 @@
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import json
+
 import pandas as pd
 import numpy as np
 import os
@@ -491,6 +495,25 @@ def run_pipeline():
 
         save_hourly_history(hist_entry, HISTORY_FILE)
 
+
+        def backup_to_google_sheets(df):
+            try:
+                creds_dict = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+                scope = ["https://spreadsheets.google.com/feeds",
+                        "https://www.googleapis.com/auth/drive"]
+                creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+                client = gspread.authorize(creds)
+
+                sheet = client.open_by_key(os.environ["GOOGLE_SHEET_ID"]).sheet1
+
+                rows = df.values.tolist()
+                sheet.append_rows(rows)
+
+                print("Backup to Google Sheets: SUCCESS")
+            except Exception as e:
+                print("Backup FAILED:", e)
+
+
         # 24-hour forecast 
         forecast_df = forecast_24h_recursive(
             aqi_now=aqi_now,
@@ -529,6 +552,14 @@ def run_pipeline():
         )
         df_now.to_csv(snapshot_path, index=False)
         print("Snapshot saved →", snapshot_path)
+
+         # Backup hourly history to Google Sheets
+        try:
+            hist_df = pd.DataFrame(all_now)
+            backup_to_google_sheets(hist_df)
+        except Exception as e:
+            print("Backup Error:", e)
+
 
 
 if __name__ == "__main__":

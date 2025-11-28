@@ -9,5 +9,6 @@ scikit-learn
 psycopg2-binary
 SQLAlchemy
 python-dotenv
-
+gspread
+oauth2client
 
