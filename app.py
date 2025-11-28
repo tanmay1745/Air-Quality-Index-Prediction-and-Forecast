@@ -7,7 +7,6 @@ import plotly.graph_objects as go
 from datetime import datetime
 
 
-st.write("Scheduler imported successfully")
 
 st.set_page_config(layout="wide", page_title="AQI Dashboard")
 
