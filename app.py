@@ -10,8 +10,10 @@ st.set_page_config(layout="wide", page_title="AQI Dashboard")
 # CONFIG
 BASE = "."
 STATIONS_PATH = rf"{BASE}/Final_Station.csv"
-HISTORY_PATH = rf"{BASE}/hourly_history.csv"
-FORECAST_DIR = rf"{BASE}/forecast"
+# HISTORY_PATH = rf"{BASE}/mnt/aqi/hourly_history.csv"
+# FORECAST_DIR = rf"{BASE}/mnt/aqi/forecast"
+HISTORY_PATH = "/mnt/aqi/hourly_history.csv"
+FORECAST_DIR = "/mnt/aqi/forecast"
 
 
 # LOAD DATA 

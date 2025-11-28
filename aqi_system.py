@@ -19,8 +19,11 @@ STATIONS_PATH = os.path.join(PROJECT_BASE, "Final_Station.csv")
 MODEL_PATH = os.environ.get("MODEL_PATH", os.path.join("models", "CatBoost_Optimized.pkl"))
 FEATURE_PATH = os.environ.get("FEATURE_PATH", os.path.join("models", "feature_cols_new.pkl"))
 HISTORICAL_UPLOAD_PATH = os.path.join(PROJECT_BASE, "data", "Preprocessed_Data_Final.xls")
-HISTORY_FILE = os.path.join(PROJECT_BASE, "hourly_history.csv")
-FORECAST_DIR = os.path.join(PROJECT_BASE, "forecast")
+# HISTORY_FILE = os.path.join(PROJECT_BASE, "hourly_history.csv")
+# FORECAST_DIR = os.path.join(PROJECT_BASE, "forecast")
+
+HISTORY_FILE = "/mnt/aqi/hourly_history.csv"
+FORECAST_DIR = "/mnt/aqi/forecast"
 
 SLEEP_BETWEEN = 0.5
 
@@ -518,11 +521,12 @@ def run_pipeline():
     # Save snapshot of all predictions 
     if all_now:
         df_now = pd.DataFrame(all_now)
-        snap_dir = os.path.join(PROJECT_BASE, "nowcast_snapshot")
-        os.makedirs(snap_dir, exist_ok=True)
+        # snap_dir = os.path.join(PROJECT_BASE, "nowcast_snapshot")
+        SNAPSHOT_DIR = "/mnt/aqi/nowcast_snapshot"
+        os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
         snapshot_path = os.path.join(
-            snap_dir,
+            SNAPSHOT_DIR,
             f"nowcast_snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         )
         df_now.to_csv(snapshot_path, index=False)
