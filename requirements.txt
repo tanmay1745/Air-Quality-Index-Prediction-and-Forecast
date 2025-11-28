@@ -1,0 +1,13 @@
+streamlit
+pandas
+numpy
+requests
+plotly
+joblib
+catboost
+scikit-learn
+psycopg2-binary
+SQLAlchemy
+python-dotenv
+
+
