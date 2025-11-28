@@ -42,11 +42,10 @@ def load_forecast(station_id):
 stations = load_stations()
 history = load_history()
 
-# Guard: if history exists but missing StationId, show warning and stop 
-if (not history.empty) and ("StationId" not in history.columns):
-    st.warning("hourly_history.csv exists but is missing the 'StationId' column. Waiting for a fresh cron run to recreate it.")
+# --- SAFE GUARD: if history is empty OR missing StationId, show message and stop ---
+if history.empty or ("StationId" not in history.columns):
+    st.warning("hourly_history.csv not ready yet. Waiting for the cron job to create a valid file with 'StationId' column.")
     st.stop()
-
 
 if stations.empty:
     st.error("Stations CSV not found in this folder.")
