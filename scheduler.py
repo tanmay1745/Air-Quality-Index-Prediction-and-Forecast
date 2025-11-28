@@ -1,13 +1,14 @@
+import threading
 import time
 import subprocess
-import threading
 
-def run_worker():
+def run_pipeline_loop():
     while True:
-        print("Running AQI Pipeline...")
+        print("Running AQI pipeline...")
         subprocess.run(["python", "aqi_system.py"])
-        print("Sleeping for 1 hour...")
+        print("Pipeline completed. Sleeping 1 hour...")
         time.sleep(3600)
 
-t = threading.Thread(target=run_worker, daemon=True)
-t.start()
+# Start background thread
+thread = threading.Thread(target=run_pipeline_loop, daemon=True)
+thread.start()
