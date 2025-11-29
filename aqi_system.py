@@ -50,12 +50,12 @@ def load_stations(path=STATIONS_PATH):
 def fetch_live_waqi(waqi_id):
     """
     Fetch WAQI feed for a station and return a normalized live dict.
-    This will try to extract all commonly available iaqi fields and map them to the
-    feature names your model expects:
+    This will try to extract all commonly available waqi fields and map them to the
+    feature names the model expects:
       - PM2.5, NO2, CO, SO2, O3
       - Temperature, RelativeHumidity, WindSpeed
       - Pressure (p), DewPoint (dew), WindDirection (wd)
-    Missing values -> 0 (you can change fallback to np.nan if preferred).
+    Missing values -> 0
     Returns (live_dict, status_str)
     """
     url = f"https://api.waqi.info/feed/@{waqi_id}/?token={API_KEY}"
@@ -90,14 +90,14 @@ def fetch_live_waqi(waqi_id):
         "Temperature": g("t"),            # WAQI 't' is temp
         "RelativeHumidity": g("h"),       # WAQI 'h' is humidity
         "WindSpeed": g("w"),              # WAQI 'w' is wind speed
-        # additional fields (map to your feature_list names)
+        # additional fields (map to feature_list names)
         "Pressure": g("p") or g("pressure"),
         "DewPoint": g("dew") or g("dewpoint"),
         "WindDirection": g("wd") or g("winddir") or g("wind_direction"),
     }
 
     # Some feeds embed values under different keys (rare) — attempt a second pass
-    # if any of the additional keys are zero, try scanning iaqi keys for close matches.
+    # if any of the additional keys are zero, try scanning waqi keys for close matches.
     if live["Pressure"] == 0.0 or live["DewPoint"] == 0.0 or live["WindDirection"] == 0.0:
         for k, v in iaqi.items():
             if not isinstance(v, dict):
@@ -123,7 +123,7 @@ def fetch_live_waqi(waqi_id):
 
 def ensure_feature_list(features_path=FEATURE_PATH, fallback_hist=HISTORICAL_UPLOAD_PATH):
     """
-    Ensure JSON feature list exists. If not, try to build from historical file columns.
+    Ensures JSON feature list exists, if not, try to build from historical file columns.
     Feature list = all columns in historical df minus ["AQI","StationId","Datetime","Unnamed: 0"].
     """
     if os.path.exists(features_path):
@@ -316,9 +316,7 @@ def save_hourly_history(entry, history_path=HISTORY_FILE):
       - Sorted by datetime
       - No duplicate timestamps per station
     """
-    import pandas as pd
-    import numpy as np
-    import os
+
 
     df_entry = pd.DataFrame([entry])
 
@@ -360,7 +358,7 @@ def save_hourly_history(entry, history_path=HISTORY_FILE):
             (hist["StationId"] == df_entry["StationId"].iloc[0]) &
             (hist["Datetime"] == df_entry["Datetime"].iloc[0])
         )]
-        # (optional) print(f"Removed duplicates: {before_len-len(hist)}")
+        
 
     # Append new entry 
     hist = pd.concat([hist, df_entry], ignore_index=True)
@@ -377,16 +375,14 @@ def save_hourly_history(entry, history_path=HISTORY_FILE):
 def forecast_24h_recursive(aqi_now, live_dict, model, feature_list, station_enc=0, seed_dt=None):
     """
     24-hour forecast using static live pollutant/weather features.
-    Why static?
-      - Your model uses PM2.5 lag/rolling from HISTORY, NOT future predictions.
+    Why static:-
+      - Model uses PM2.5 lag/rolling from HISTORY, NOT future predictions.
       - For forecasting, WAQI future values are unknown.
     So:
       - We only vary datetime-dependent features (hour, DOW, month, season, etc.)
       - Pollutants/weather remain last-known values (live_dict)
       - Lags/rollings remain based on HISTORY (computed inside build_feature_row)
     """
-    from datetime import datetime, timedelta
-    import pandas as pd
 
     if seed_dt is None:
         seed_dt = datetime.now()
@@ -418,11 +414,6 @@ def forecast_24h_recursive(aqi_now, live_dict, model, feature_list, station_enc=
 
 # Main pipeline 
 def run_pipeline():
-    import pandas as pd
-    import numpy as np
-    from datetime import datetime
-    import os
-    import time
 
     # 1) Load stations
     stations = load_stations(STATIONS_PATH)
@@ -437,20 +428,46 @@ def run_pipeline():
 
     all_now = []
 
+    # GOOGLE SHEETS BACKUP FUNCTION 
+    def backup_to_google_sheets():
+        print("Backing up FULL hourly_history.csv to Google Sheets...")
+
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive"
+        ]
+
+        creds = ServiceAccountCredentials.from_json_keyfile_name(
+            "service_account.json", scope
+        )
+        client = gspread.authorize(creds)
+
+        sheet = client.open_by_key(os.environ["GOOGLE_SHEET_ID"]).sheet1
+
+        if not os.path.exists(HISTORY_FILE):
+            print("History file missing, skipping backup.")
+            return
+
+        df = pd.read_csv(HISTORY_FILE)
+        df = df.fillna("")
+        sheet.clear()
+        data = [df.columns.tolist()] + df.values.tolist()
+        sheet.update(data)
+
+        print("Backup SUCCESS — Full hourly_history uploaded.")
+
     # 4) Iterate through each station
     for idx, s in stations.iterrows():
         st_id = s["StationId"]
         waqi_id = s["waqi_id"]
         st_enc = s["StationId_enc"]
 
-        # Fetch live WAQI data 
         live, status = fetch_live_waqi(waqi_id)
         if live is None:
             print(f"[{st_id}] WAQI fetch failed: {status}")
             time.sleep(SLEEP_BETWEEN)
             continue
 
-        # Build feature row for NOW 
         row = build_feature_row(
             live_dict=live,
             station_enc=st_enc,
@@ -458,7 +475,6 @@ def run_pipeline():
             dt=datetime.now()
         )
 
-        # Predict current AQI
         try:
             aqi_now = float(model.predict(row)[0])
         except Exception as e:
@@ -466,25 +482,18 @@ def run_pipeline():
             time.sleep(SLEEP_BETWEEN)
             continue
 
-        # Save hourly history entry 
         hist_entry = {
             "StationId": st_id,
             "StationName": s.get("StationName", ""),
             "City": s.get("City", ""),
             "StationId_enc": st_enc,
             "Datetime": datetime.now().isoformat(),
-
-            # model target
             "AQI": aqi_now,
-
-            # pollutants
             "PM2.5": live.get("PM2.5"),
             "NO2": live.get("NO2"),
             "CO": live.get("CO"),
             "SO2": live.get("SO2"),
             "O3": live.get("O3"),
-
-            # weather
             "Temperature": live.get("Temperature"),
             "RelativeHumidity": live.get("RelativeHumidity"),
             "WindSpeed": live.get("WindSpeed"),
@@ -495,26 +504,6 @@ def run_pipeline():
 
         save_hourly_history(hist_entry, HISTORY_FILE)
 
-
-        def backup_to_google_sheets(df):
-            try:
-                creds_dict = json.loads(os.environ["GOOGLE_CREDENTIALS"])
-                scope = ["https://spreadsheets.google.com/feeds",
-                        "https://www.googleapis.com/auth/drive"]
-                creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-                client = gspread.authorize(creds)
-
-                sheet = client.open_by_key(os.environ["GOOGLE_SHEET_ID"]).sheet1
-
-                rows = df.values.tolist()
-                sheet.append_rows(rows)
-
-                print("Backup to Google Sheets: SUCCESS")
-            except Exception as e:
-                print("Backup FAILED:", e)
-
-
-        # 24-hour forecast 
         forecast_df = forecast_24h_recursive(
             aqi_now=aqi_now,
             live_dict=live,
@@ -524,12 +513,10 @@ def run_pipeline():
             seed_dt=datetime.now()
         )
 
-        # Save forecast output
         out_csv = os.path.join(FORECAST_DIR, f"forecast_24h_{st_id}.csv")
         forecast_df.to_csv(out_csv, index=False)
         print(f"[{st_id}] AQI Now: {aqi_now:.1f} | Forecast saved → {out_csv}")
 
-        # Add to nowcast snapshot list
         all_now.append({
             "StationId": st_id,
             "StationName": s.get("StationName", ""),
@@ -540,7 +527,7 @@ def run_pipeline():
 
         time.sleep(SLEEP_BETWEEN)
 
-    # Save snapshot of all predictions 
+    # SAVE SNAPSHOT (only once)
     if all_now:
         df_now = pd.DataFrame(all_now)
         snap_dir = os.path.join(PROJECT_BASE, "nowcast_snapshot")
@@ -553,12 +540,14 @@ def run_pipeline():
         df_now.to_csv(snapshot_path, index=False)
         print("Snapshot saved →", snapshot_path)
 
-         # Backup hourly history to Google Sheets
-        try:
-            hist_df = pd.DataFrame(all_now)
-            backup_to_google_sheets(hist_df)
-        except Exception as e:
-            print("Backup Error:", e)
+
+    # BACKUP TO GOOGLE SHEETS (only once, after snapshot)
+    try:
+        backup_to_google_sheets()
+    except Exception as e:
+        print("Backup Error:", e)
+
+    print("Pipeline complete. History updated at:", HISTORY_FILE)
 
 
 
