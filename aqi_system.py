@@ -437,9 +437,9 @@ def run_pipeline():
             "https://www.googleapis.com/auth/drive"
         ]
 
-        creds = ServiceAccountCredentials.from_json_keyfile_name(
-            "service_account.json", scope
-        )
+        json_path = "/etc/secrets/SERVICE_ACCOUNT_JSON"
+        creds = ServiceAccountCredentials.from_json_keyfile_name(json_path, scope)
+
         client = gspread.authorize(creds)
 
         sheet = client.open_by_key(os.environ["GOOGLE_SHEET_ID"]).sheet1

@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: aqi-web
+    runtime: python3
+    startCommand: "streamlit run app.py --server.port 10000 --server.address 0.0.0.0"
+
+  - type: worker
+    name: aqi-worker
+    runtime: python3
+    startCommand: "python scheduler.py"
+    envVars:
+      - key: GOOGLE_CREDENTIALS
+        sync: false
+      - key: GOOGLE_SHEET_ID
+        sync: false
+      - key: WAQI_API_KEY
+        sync: false
+      - key: MODEL_PATH
+        sync: false
+      - key: FEATURE_PATH
+        sync: false
+      - key: PROJECT_BASE
+        sync: false
+    secretFiles:
+      SERVICE_ACCOUNT_JSON: /etc/secrets/SERVICE_ACCOUNT_JSON
