@@ -24,14 +24,38 @@ def load_stations():
         return pd.DataFrame()
     return pd.read_csv(STATIONS_PATH)
 
-@st.cache_data(ttl=10)
+# @st.cache_data(ttl=10)
+# def load_history():
+#     if not os.path.exists(HISTORY_PATH):
+#         return pd.DataFrame()
+#     try:
+#         return pd.read_csv(HISTORY_PATH, parse_dates=["Datetime"])
+#     except Exception:
+#         return pd.DataFrame()
+
+
+@st.cache_data(ttl=60)
 def load_history():
-    if not os.path.exists(HISTORY_PATH):
+    import gspread
+    from oauth2client.service_account import ServiceAccountCredentials
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    json_path = "/etc/secrets/SERVICE_ACCOUNT_JSON"
+    creds = ServiceAccountCredentials.from_json_keyfile_name(json_path, scope)
+    client = gspread.authorize(creds)
+    sheet = client.open_by_key(os.environ["GOOGLE_SHEET_ID"]).sheet1
+    
+    data = sheet.get_all_records()
+    if not data:
         return pd.DataFrame()
-    try:
-        return pd.read_csv(HISTORY_PATH, parse_dates=["Datetime"])
-    except Exception:
-        return pd.DataFrame()
+    
+    df = pd.DataFrame(data)
+    if "Datetime" in df.columns:
+        df["Datetime"] = pd.to_datetime(df["Datetime"])
+    return df
+
 
 @st.cache_data(ttl=10)
 def load_forecast(station_id):

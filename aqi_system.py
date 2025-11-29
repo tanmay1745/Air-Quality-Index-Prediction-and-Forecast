@@ -429,8 +429,8 @@ def run_pipeline():
     all_now = []
 
     # GOOGLE SHEETS BACKUP FUNCTION 
-    def backup_to_google_sheets():
-        print("Backing up FULL hourly_history.csv to Google Sheets...")
+    def backup_last_hour_rows():
+        print("Appending all stations’ latest hourly rows to Google Sheets...")
 
         scope = [
             "https://spreadsheets.google.com/feeds",
@@ -439,22 +439,39 @@ def run_pipeline():
 
         json_path = "/etc/secrets/SERVICE_ACCOUNT_JSON"
         creds = ServiceAccountCredentials.from_json_keyfile_name(json_path, scope)
-
         client = gspread.authorize(creds)
 
         sheet = client.open_by_key(os.environ["GOOGLE_SHEET_ID"]).sheet1
 
+        # Load full history
         if not os.path.exists(HISTORY_FILE):
             print("History file missing, skipping backup.")
             return
 
         df = pd.read_csv(HISTORY_FILE)
-        df = df.fillna("")
-        sheet.clear()
-        data = [df.columns.tolist()] + df.values.tolist()
-        sheet.update(data)
+        df["Datetime"] = pd.to_datetime(df["Datetime"])
 
-        print("Backup SUCCESS — Full hourly_history uploaded.")
+        # Identify latest timestamp (the current hour)
+        latest_ts = df["Datetime"].max()
+
+        # Rows ONLY from the latest hour
+        new_rows = df[df["Datetime"] == latest_ts]
+
+        if new_rows.empty:
+            print("No new rows to append.")
+            return
+
+        # If first-time: write header
+        existing_data = sheet.get_all_values()
+        if len(existing_data) == 0:
+            sheet.append_row(new_rows.columns.tolist())
+
+        # Append each row
+        for _, r in new_rows.iterrows():
+            sheet.append_row(list(r.values))
+
+        print(f"Append SUCCESS — {len(new_rows)} new rows saved to Google Sheet.")
+
 
     # 4) Iterate through each station
     for idx, s in stations.iterrows():
@@ -543,7 +560,7 @@ def run_pipeline():
 
     # BACKUP TO GOOGLE SHEETS (only once, after snapshot)
     try:
-        backup_to_google_sheets()
+        backup_last_hour_rows()
     except Exception as e:
         print("Backup Error:", e)
 
