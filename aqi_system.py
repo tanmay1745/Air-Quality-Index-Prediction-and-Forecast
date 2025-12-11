@@ -1,42 +1,41 @@
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+import os
+import time
 import json
+from datetime imp)ort datetime, timedelta
 
 import pandas as pd
 import numpy as np
-import os
-import json
-import time
-from datetime import datetime, timedelta
 import requests
 import joblib
 
+# gspread + oauth
+try:
+    import gspread
+    from oauth2client.service_account import ServiceAccountCredentials
+except Exception:
+    gspread = None
+    ServiceAccountCredentials = None
 
-# CONFIG (ENV-based, no hard-coded paths)
-import os
-
-API_KEY = os.environ.get("WAQI_API_KEY", "")     
-PROJECT_BASE = os.environ.get("PROJECT_BASE", ".")   
-
-# Paths relative to project root
-STATIONS_PATH = os.path.join(PROJECT_BASE, "Final_Station.csv")
+# CONFIG (env)
+API_KEY = os.environ.get("WAQI_API_KEY", "")
+PROJECT_BASE = os.environ.get("PROJECT_BASE", ".")
 MODEL_PATH = os.environ.get("MODEL_PATH", os.path.join("models", "CatBoost_Optimized.pkl"))
 FEATURE_PATH = os.environ.get("FEATURE_PATH", os.path.join("models", "feature_cols_new.pkl"))
 HISTORICAL_UPLOAD_PATH = os.path.join(PROJECT_BASE, "data", "Preprocessed_Data_Final.xls")
 HISTORY_FILE = os.path.join(PROJECT_BASE, "hourly_history.csv")
 FORECAST_DIR = os.path.join(PROJECT_BASE, "forecast")
+SLEEP_BETWEEN = float(os.environ.get("SLEEP_BETWEEN", 0.5))
 
+# Path where the service account JSON secret is mounted (Render secret)
+SERVICE_ACCOUNT_JSON = os.environ.get("SERVICE_ACCOUNT_JSON_PATH", "/etc/secrets/SERVICE_ACCOUNT_JSON")
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
 
-
-SLEEP_BETWEEN = 0.5
-
-# Ensure forecast folder exists
 os.makedirs(FORECAST_DIR, exist_ok=True)
 
 
+#### HELPERS ####
 
-# Helpers 
-def load_stations(path=STATIONS_PATH):
+def load_stations(path=os.path.join(PROJECT_BASE, "Final_Station.csv")):
     if not os.path.exists(path):
         raise FileNotFoundError(f"Stations file not found: {path}")
     df = pd.read_csv(path)
@@ -48,16 +47,6 @@ def load_stations(path=STATIONS_PATH):
 
 
 def fetch_live_waqi(waqi_id):
-    """
-    Fetch WAQI feed for a station and return a normalized live dict.
-    This will try to extract all commonly available waqi fields and map them to the
-    feature names the model expects:
-      - PM2.5, NO2, CO, SO2, O3
-      - Temperature, RelativeHumidity, WindSpeed
-      - Pressure (p), DewPoint (dew), WindDirection (wd)
-    Missing values -> 0
-    Returns (live_dict, status_str)
-    """
     url = f"https://api.waqi.info/feed/@{waqi_id}/?token={API_KEY}"
     try:
         r = requests.get(url, timeout=10)
@@ -65,13 +54,10 @@ def fetch_live_waqi(waqi_id):
         data = r.json()
     except Exception as e:
         return None, f"error: {e}"
-
     if data.get("status") != "ok":
         return None, f"waqi_status_{data.get('status')}"
-
     iaqi = data["data"].get("iaqi", {}) or {}
 
-    # helper to safely get nested numeric v value (and coerce to float)
     def g(key):
         try:
             v = iaqi.get(key, {})
@@ -79,33 +65,27 @@ def fetch_live_waqi(waqi_id):
         except Exception:
             return 0.0
 
-    # WAQI sometimes uses slightly different keys; check common variants
-    # Primary keys we expect: 'pm25','no2','co','so2','o3','t','h','w','p','dew','wd'
     live = {
         "PM2.5": g("pm25"),
         "NO2": g("no2"),
         "CO": g("co"),
         "SO2": g("so2"),
         "O3": g("o3"),
-        "Temperature": g("t"),            # WAQI 't' is temp
-        "RelativeHumidity": g("h"),       # WAQI 'h' is humidity
-        "WindSpeed": g("w"),              # WAQI 'w' is wind speed
-        # additional fields (map to feature_list names)
+        "Temperature": g("t"),
+        "RelativeHumidity": g("h"),
+        "WindSpeed": g("w"),
         "Pressure": g("p") or g("pressure"),
         "DewPoint": g("dew") or g("dewpoint"),
         "WindDirection": g("wd") or g("winddir") or g("wind_direction"),
     }
 
-    # Some feeds embed values under different keys (rare) — attempt a second pass
-    # if any of the additional keys are zero, try scanning waqi keys for close matches.
+    # fallback scan
     if live["Pressure"] == 0.0 or live["DewPoint"] == 0.0 or live["WindDirection"] == 0.0:
         for k, v in iaqi.items():
-            if not isinstance(v, dict):
-                continue
+            if not isinstance(v, dict): continue
             key_lower = k.lower()
             val = v.get("v", None)
-            if val is None:
-                continue
+            if val is None: continue
             try:
                 val = float(val)
             except Exception:
@@ -120,66 +100,40 @@ def fetch_live_waqi(waqi_id):
     return live, "ok"
 
 
-
 def ensure_feature_list(features_path=FEATURE_PATH, fallback_hist=HISTORICAL_UPLOAD_PATH):
-    """
-    Ensures JSON feature list exists, if not, try to build from historical file columns.
-    Feature list = all columns in historical df minus ["AQI","StationId","Datetime","Unnamed: 0"].
-    """
     if os.path.exists(features_path):
-        feature_list = joblib.load(FEATURE_PATH)
-        return feature_list
-
-    # Try to build from historical upload
+        # support both joblib and json (older versions)
+        try:
+            return joblib.load(features_path)
+        except Exception:
+            with open(features_path, "r") as f:
+                return json.load(f)
     if os.path.exists(fallback_hist):
-        print("nowcast feature JSON not found — building from historical file:", fallback_hist)
         try:
             hist = pd.read_csv(fallback_hist)
         except Exception:
             hist = pd.read_excel(fallback_hist)
         cols = [c for c in hist.columns if c not in ["AQI", "StationId", "Datetime", "Unnamed: 0"]]
-        # keep only numeric/time/encoded features (exclude object columns if any)
         numeric_cols = [c for c in cols if hist[c].dtype in [np.float64, np.int64, np.int32, np.float32]]
-        # but also keep engineered time columns if present
-        # final list: numeric_cols + any known time/one-hot columns that exist
         extras = [c for c in cols if c not in numeric_cols]
         features = numeric_cols + extras
+        # save as json for future runs
         with open(features_path, "w") as f:
             json.dump(features, f)
-        print(f"Feature JSON created at {features_path} with {len(features)} features.")
         return features
-
-    raise FileNotFoundError(
-        f"Feature JSON not found ({features_path}) and historical file not available ({fallback_hist})"
-    )
+    raise FileNotFoundError("Feature JSON not found and historical file not available.")
 
 
 def build_feature_row(live_dict, station_enc, feature_list, dt=None, history_path=HISTORY_FILE):
-    """
-    Build a single-row feature DataFrame matching feature_list.
-    Includes:
-      - Raw WAQI pollutants/weather (PM2.5, NO2, CO, SO2, O3, Temp, RH, WindSpeed, Pressure, DewPoint, WindDirection)
-      - Time features (Hour_sin, Hour_cos, Month_sin, Month_cos, DOW one-hot, Season one-hot)
-      - Engineered features (Pollution_Load, PM_Ratio, Temp*Humidity, Wind_Inv)
-      - Lags: PM25_lag1, lag3, lag6, lag24; NO2_lag1, O3_lag1
-      - Rolling means: roll3, roll6, roll12, roll24
-    """
-    import pandas as pd
-    import numpy as np
+    import pandas as pd, numpy as np
     from datetime import datetime
-
     if dt is None:
         dt = datetime.now()
-
-    # Base row 
     row = pd.DataFrame([[0] * len(feature_list)], columns=feature_list)
-
-    # Fill direct live features 
     for col, val in live_dict.items():
         if col in row.columns:
             row[col] = float(val)
-
-    # Load station history (needed for lags/rollings)
+    # load history (for lags)
     try:
         hist = pd.read_csv(history_path)
         hist["Datetime"] = pd.to_datetime(hist["Datetime"])
@@ -188,14 +142,12 @@ def build_feature_row(live_dict, station_enc, feature_list, dt=None, history_pat
     except:
         hist = pd.DataFrame()
 
-    # Helper to get latest value of a column
     def get_latest(col):
         try:
             return float(hist[col].iloc[-1])
         except:
             return float(live_dict.get(col, 0))
 
-    # PM2.5 Lag Features 
     def get_lag(series, lag_hours):
         try:
             return float(series.iloc[-lag_hours])
@@ -204,59 +156,32 @@ def build_feature_row(live_dict, station_enc, feature_list, dt=None, history_pat
 
     if not hist.empty and "PM2.5" in hist.columns:
         pm25_series = hist["PM2.5"]
-
-        # PM25 Lags
-        if "PM25_lag1" in row.columns:
-            row["PM25_lag1"] = get_lag(pm25_series, 1)
-        if "PM25_lag3" in row.columns:
-            row["PM25_lag3"] = get_lag(pm25_series, 3)
-        if "PM25_lag6" in row.columns:
-            row["PM25_lag6"] = get_lag(pm25_series, 6)
-        if "PM25_lag24" in row.columns:
-            row["PM25_lag24"] = get_lag(pm25_series, 24)
-
-        # Rolling means
+        if "PM25_lag1" in row.columns: row["PM25_lag1"] = get_lag(pm25_series, 1)
+        if "PM25_lag3" in row.columns: row["PM25_lag3"] = get_lag(pm25_series, 3)
+        if "PM25_lag6" in row.columns: row["PM25_lag6"] = get_lag(pm25_series, 6)
+        if "PM25_lag24" in row.columns: row["PM25_lag24"] = get_lag(pm25_series, 24)
         def roll(series, w):
-            if len(series) >= w:
-                return float(series.tail(w).mean())
-            else:
-                return float(series.mean())
+            if len(series) >= w: return float(series.tail(w).mean())
+            return float(series.mean())
+        if "PM25_roll3" in row.columns: row["PM25_roll3"] = roll(pm25_series, 3)
+        if "PM25_roll6" in row.columns: row["PM25_roll6"] = roll(pm25_series, 6)
+        if "PM25_roll12" in row.columns: row["PM25_roll12"] = roll(pm25_series, 12)
+        if "PM25_roll24" in row.columns: row["PM25_roll24"] = roll(pm25_series, 24)
 
-        if "PM25_roll3" in row.columns:
-            row["PM25_roll3"] = roll(pm25_series, 3)
-        if "PM25_roll6" in row.columns:
-            row["PM25_roll6"] = roll(pm25_series, 6)
-        if "PM25_roll12" in row.columns:
-            row["PM25_roll12"] = roll(pm25_series, 12)
-        if "PM25_roll24" in row.columns:
-            row["PM25_roll24"] = roll(pm25_series, 24)
-
-    # NO2 & O3 Lag 1 
     if not hist.empty:
         if "NO2_lag1" in row.columns:
-            try:
-                row["NO2_lag1"] = float(hist["NO2"].iloc[-1])
-            except:
-                row["NO2_lag1"] = float(live_dict.get("NO2", 0))
-
+            try: row["NO2_lag1"] = float(hist["NO2"].iloc[-1])
+            except: row["NO2_lag1"] = float(live_dict.get("NO2", 0))
         if "O3_lag1" in row.columns:
-            try:
-                row["O3_lag1"] = float(hist["O3"].iloc[-1])
-            except:
-                row["O3_lag1"] = float(live_dict.get("O3", 0))
+            try: row["O3_lag1"] = float(hist["O3"].iloc[-1])
+            except: row["O3_lag1"] = float(live_dict.get("O3", 0))
 
-    # Time based features 
-    # Cyclic hour and month
-    if "Hour_sin" in row.columns:
-        row["Hour_sin"] = np.sin(2 * np.pi * dt.hour / 24)
-    if "Hour_cos" in row.columns:
-        row["Hour_cos"] = np.cos(2 * np.pi * dt.hour / 24)
-    if "Month_sin" in row.columns:
-        row["Month_sin"] = np.sin(2 * np.pi * dt.month / 12)
-    if "Month_cos" in row.columns:
-        row["Month_cos"] = np.cos(2 * np.pi * dt.month / 12)
-
-    # Hour, DayOfWeek, Month, Quarter, Year, DayOfYear, IsWeekend
+    # time features
+    import numpy as np
+    if "Hour_sin" in row.columns: row["Hour_sin"] = np.sin(2 * np.pi * dt.hour / 24)
+    if "Hour_cos" in row.columns: row["Hour_cos"] = np.cos(2 * np.pi * dt.hour / 24)
+    if "Month_sin" in row.columns: row["Month_sin"] = np.sin(2 * np.pi * dt.month / 12)
+    if "Month_cos" in row.columns: row["Month_cos"] = np.cos(2 * np.pi * dt.month / 12)
     if "Hour" in row.columns: row["Hour"] = dt.hour
     if "DayOfWeek" in row.columns: row["DayOfWeek"] = dt.weekday()
     if "IsWeekend" in row.columns: row["IsWeekend"] = int(dt.weekday() >= 5)
@@ -265,22 +190,16 @@ def build_feature_row(live_dict, station_enc, feature_list, dt=None, history_pat
     if "DayOfYear" in row.columns: row["DayOfYear"] = dt.timetuple().tm_yday
     if "Year" in row.columns: row["Year"] = dt.year
 
-    # Day-of-week one-hot
     dow = dt.weekday()
     dow_map = ["Day_Monday", "Day_Tuesday", "Day_Wednesday", "Day_Thursday",
                "Day_Friday", "Day_Saturday", "Day_Sunday"]
     for i, c in enumerate(dow_map):
         if c in row.columns: row[c] = 1 if i == dow else 0
 
-    # Season one-hot
-    if "Season_Winter" in row.columns:
-        row["Season_Winter"] = 1 if dt.month in [12, 1, 2] else 0
-    if "Season_Summer" in row.columns:
-        row["Season_Summer"] = 1 if dt.month in [4, 5, 6] else 0
-    if "Season_PostMonsoon" in row.columns:
-        row["Season_PostMonsoon"] = 1 if dt.month in [10, 11] else 0
+    if "Season_Winter" in row.columns: row["Season_Winter"] = 1 if dt.month in [12,1,2] else 0
+    if "Season_Summer" in row.columns: row["Season_Summer"] = 1 if dt.month in [4,5,6] else 0
+    if "Season_PostMonsoon" in row.columns: row["Season_PostMonsoon"] = 1 if dt.month in [10,11] else 0
 
-    # Engineered interactions
     pm25 = float(live_dict.get("PM2.5", 0))
     no2 = float(live_dict.get("NO2", 0))
     o3 = float(live_dict.get("O3", 0))
@@ -288,192 +207,182 @@ def build_feature_row(live_dict, station_enc, feature_list, dt=None, history_pat
     rh = float(live_dict.get("RelativeHumidity", 0))
     ws = float(live_dict.get("WindSpeed", 0))
 
-    if "Pollution_Load" in row.columns:
-        row["Pollution_Load"] = pm25 + no2 + live_dict.get("CO", 0) + live_dict.get("SO2", 0) + o3
-
-    if "PM_Ratio" in row.columns:
-        row["PM_Ratio"] = pm25 / (no2 + o3 + 1e-6)
-
-    if "Temp_Humidity_Interaction" in row.columns:
-        row["Temp_Humidity_Interaction"] = temp * rh
-
-    if "Wind_Inv" in row.columns:
-        row["Wind_Inv"] = 1.0 / (ws + 1e-6)
-
-    # Station Encoding 
-    if "StationId_enc" in row.columns:
-        row["StationId_enc"] = station_enc
+    if "Pollution_Load" in row.columns: row["Pollution_Load"] = pm25 + no2 + live_dict.get("CO", 0) + live_dict.get("SO2", 0) + o3
+    if "PM_Ratio" in row.columns: row["PM_Ratio"] = pm25 / (no2 + o3 + 1e-6)
+    if "Temp_Humidity_Interaction" in row.columns: row["Temp_Humidity_Interaction"] = temp * rh
+    if "Wind_Inv" in row.columns: row["Wind_Inv"] = 1.0 / (ws + 1e-6)
+    if "StationId_enc" in row.columns: row["StationId_enc"] = station_enc
 
     return row
 
 
 def save_hourly_history(entry, history_path=HISTORY_FILE):
-    """
-    Append a new hourly entry to history CSV.
-    Ensures:
-      - Consistent columns
-      - New columns auto-added if needed
-      - Sorted by datetime
-      - No duplicate timestamps per station
-    """
-
-
     df_entry = pd.DataFrame([entry])
-
-    # If file does not exist → create it with this row
     if not os.path.exists(history_path):
         df_entry.to_csv(history_path, index=False)
         return
-
-    # Load existing history
     try:
         hist = pd.read_csv(history_path)
     except Exception:
         hist = pd.DataFrame()
-
-    # Ensure Datetime is datetime
     try:
         df_entry["Datetime"] = pd.to_datetime(df_entry["Datetime"])
         if "Datetime" in hist.columns:
             hist["Datetime"] = pd.to_datetime(hist["Datetime"])
     except:
         pass
-
-    # Ensure all columns exist in both 
     all_cols = sorted(list(set(hist.columns).union(set(df_entry.columns))))
-
     for col in all_cols:
-        if col not in hist.columns:
-            hist[col] = np.nan
-        if col not in df_entry.columns:
-            df_entry[col] = np.nan
-
+        if col not in hist.columns: hist[col] = np.nan
+        if col not in df_entry.columns: df_entry[col] = np.nan
     hist = hist[all_cols]
     df_entry = df_entry[all_cols]
-
-    # Remove duplicates for SAME station + datetime 
     if "StationId" in all_cols and "Datetime" in all_cols:
-        before_len = len(hist)
         hist = hist[~(
             (hist["StationId"] == df_entry["StationId"].iloc[0]) &
             (hist["Datetime"] == df_entry["Datetime"].iloc[0])
         )]
-        
-
-    # Append new entry 
     hist = pd.concat([hist, df_entry], ignore_index=True)
-
-    # Sort by datetime (important for lags/rolling) 
     if "Datetime" in hist.columns:
         hist = hist.sort_values("Datetime")
-
-    # Save 
     hist.to_csv(history_path, index=False)
 
 
-
 def forecast_24h_recursive(aqi_now, live_dict, model, feature_list, station_enc=0, seed_dt=None):
-    """
-    24-hour forecast using static live pollutant/weather features.
-    Why static:-
-      - Model uses PM2.5 lag/rolling from HISTORY, NOT future predictions.
-      - For forecasting, WAQI future values are unknown.
-    So:
-      - We only vary datetime-dependent features (hour, DOW, month, season, etc.)
-      - Pollutants/weather remain last-known values (live_dict)
-      - Lags/rollings remain based on HISTORY (computed inside build_feature_row)
-    """
-
     if seed_dt is None:
         seed_dt = datetime.now()
-
     out = []
-
     for h in range(1, 25):
         forecast_dt = seed_dt + timedelta(hours=h)
-
-        # Build feature row for this future hour
-        row = build_feature_row(
-            live_dict=live_dict,
-            station_enc=station_enc,
-            feature_list=feature_list,
-            dt=forecast_dt
-        )
-
-        # Predict
+        row = build_feature_row(live_dict=live_dict, station_enc=station_enc, feature_list=feature_list, dt=forecast_dt)
         try:
             pred = float(model.predict(row)[0])
-        except Exception as e:
+        except Exception:
             pred = float("nan")
-
-        out.append({"Datetime": forecast_dt, "AQI": pred})
-
+        out.append({"Datetime": forecast_dt.isoformat(), "AQI": pred})
     return pd.DataFrame(out)
 
 
+#### GOOGLE SHEETS APPEND-ONLY BACKUP (worker) ####
 
-# Main pipeline 
+def _get_gsheet_client():
+    if gspread is None or ServiceAccountCredentials is None:
+        return None
+    if not os.path.exists(SERVICE_ACCOUNT_JSON):
+        return None
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_JSON, scope)
+    client = gspread.authorize(creds)
+    return client
+
+
+def append_rows_to_sheet(sheet, rows, header=None):
+    """
+    Append rows (list of lists) to a worksheet.
+    If worksheet is empty, optionally write header first.
+    """
+    existing = sheet.get_all_values()
+    if len(existing) == 0 and header:
+        # add header
+        sheet.append_row(header, value_input_option="USER_ENTERED")
+    if rows:
+        # append multiple rows in a batch
+        # gspread supports append_rows
+        try:
+            sheet.append_rows(rows, value_input_option="USER_ENTERED")
+        except Exception:
+            # fallback to single append if batch fails
+            for r in rows:
+                sheet.append_row(r, value_input_option="USER_ENTERED")
+
+
+def backup_last_hour_rows_and_forecasts():
+    """
+    Append latest-hour rows (all stations) to HourlyHistory sheet,
+    and append all per-station forecast rows to Forecasts sheet.
+    Append-only; never clears existing content.
+    """
+    client = _get_gsheet_client()
+    if client is None or not GOOGLE_SHEET_ID:
+        print("Google Sheets client/ID missing — skipping backup.")
+        return
+
+    try:
+        book = client.open_by_key(GOOGLE_SHEET_ID)
+    except Exception as e:
+        print("Failed opening Google Sheet:", e)
+        return
+
+    # ensure worksheets exist (create if missing)
+    try:
+        wh_hist = book.worksheet("HourlyHistory")
+    except Exception:
+        wh_hist = book.add_worksheet(title="HourlyHistory", rows="1000", cols="30")
+    try:
+        wh_fore = book.worksheet("Forecasts")
+    except Exception:
+        wh_fore = book.add_worksheet(title="Forecasts", rows="10000", cols="6")
+
+    # read local history
+    if not os.path.exists(HISTORY_FILE):
+        print("Local history missing, skipping Google backup.")
+        return
+    df = pd.read_csv(HISTORY_FILE)
+    if "Datetime" in df.columns:
+        df["Datetime"] = pd.to_datetime(df["Datetime"])
+
+    if df.empty:
+        print("History empty, nothing to append.")
+        return
+
+    # Latest timestamp rows (the single last hourly run)
+    latest_ts = df["Datetime"].max()
+    new_rows = df[df["Datetime"] == latest_ts].copy()
+    if new_rows.empty:
+        print("No new rows for latest timestamp to append.")
+    else:
+        # prepare header and rows
+        header = new_rows.columns.tolist()
+        rows = new_rows.fillna("").values.tolist()
+        append_rows_to_sheet(wh_hist, rows, header=header)
+        print(f"Appended {len(rows)} rows to HourlyHistory")
+
+    # Append forecasts: for each forecast CSV in FORECAST_DIR create rows: StationId, Datetime, AQI
+    forecast_files = sorted([f for f in os.listdir(FORECAST_DIR) if f.startswith("forecast_24h_") and f.endswith(".csv")])
+    forecast_rows = []
+    for f in forecast_files:
+        st_id = f.replace("forecast_24h_", "").replace(".csv", "")
+        try:
+            fdf = pd.read_csv(os.path.join(FORECAST_DIR, f))
+            # ensure Datetime is string/ISO
+            if "Datetime" in fdf.columns:
+                try:
+                    fdf["Datetime"] = pd.to_datetime(fdf["Datetime"]).dt.strftime("%Y-%m-%dT%H:%M:%S")
+                except:
+                    fdf["Datetime"] = fdf["Datetime"].astype(str)
+            for _, r in fdf.iterrows():
+                forecast_rows.append([st_id, r.get("Datetime", ""), r.get("AQI", "")])
+        except Exception:
+            continue
+
+    if forecast_rows:
+        # header
+        header_f = ["StationId", "Datetime", "AQI"]
+        append_rows_to_sheet(wh_fore, forecast_rows, header=header_f)
+        print(f"Appended {len(forecast_rows)} forecast rows to Forecasts")
+
+
+#### MAIN PIPELINE ####
+
 def run_pipeline():
-
-    # 1) Load stations
-    stations = load_stations(STATIONS_PATH)
-
-    # 2) Load feature list (47 features)
-    features = ensure_feature_list(FEATURE_PATH, HISTORICAL_UPLOAD_PATH)
-
-    # 3) Load model
+    stations = load_stations()
+    features = ensure_feature_list()
     if not os.path.exists(MODEL_PATH):
         raise FileNotFoundError(f"Model not found at: {MODEL_PATH}")
     model = joblib.load(MODEL_PATH)
 
     all_now = []
 
-    # GOOGLE SHEETS BACKUP FUNCTION 
-    def backup_last_hour_rows():
-        print("Appending all stations’ latest hourly rows to Google Sheets...")
-
-        scope = [
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive"
-        ]
-
-        json_path = "/etc/secrets/SERVICE_ACCOUNT_JSON"
-        creds = ServiceAccountCredentials.from_json_keyfile_name(json_path, scope)
-        client = gspread.authorize(creds)
-
-        sheet = client.open_by_key(os.environ["GOOGLE_SHEET_ID"]).sheet1
-
-        # Load full history
-        if not os.path.exists(HISTORY_FILE):
-            print("History file missing, skipping backup.")
-            return
-
-        df = pd.read_csv(HISTORY_FILE)
-        df["Datetime"] = pd.to_datetime(df["Datetime"])
-
-        # Identify latest timestamp (the current hour)
-        latest_ts = df["Datetime"].max()
-
-        # Rows ONLY from the latest hour
-        new_rows = df[df["Datetime"] == latest_ts]
-
-        if new_rows.empty:
-            print("No new rows to append.")
-            return
-
-        # If first-time: write header
-        existing_data = sheet.get_all_values()
-        if len(existing_data) == 0:
-            sheet.append_row(new_rows.columns.tolist())
-
-        # Append each row
-        for _, r in new_rows.iterrows():
-            sheet.append_row(list(r.values))
-
-        print(f"Append SUCCESS — {len(new_rows)} new rows saved to Google Sheet.")
-
-
-    # 4) Iterate through each station
     for idx, s in stations.iterrows():
         st_id = s["StationId"]
         waqi_id = s["waqi_id"]
@@ -485,13 +394,7 @@ def run_pipeline():
             time.sleep(SLEEP_BETWEEN)
             continue
 
-        row = build_feature_row(
-            live_dict=live,
-            station_enc=st_enc,
-            feature_list=features,
-            dt=datetime.now()
-        )
-
+        row = build_feature_row(live_dict=live, station_enc=st_enc, feature_list=features, dt=datetime.now())
         try:
             aqi_now = float(model.predict(row)[0])
         except Exception as e:
@@ -521,51 +424,31 @@ def run_pipeline():
 
         save_hourly_history(hist_entry, HISTORY_FILE)
 
-        forecast_df = forecast_24h_recursive(
-            aqi_now=aqi_now,
-            live_dict=live,
-            model=model,
-            feature_list=features,
-            station_enc=st_enc,
-            seed_dt=datetime.now()
-        )
-
+        forecast_df = forecast_24h_recursive(aqi_now=aqi_now, live_dict=live, model=model, feature_list=features, station_enc=st_enc, seed_dt=datetime.now())
         out_csv = os.path.join(FORECAST_DIR, f"forecast_24h_{st_id}.csv")
         forecast_df.to_csv(out_csv, index=False)
         print(f"[{st_id}] AQI Now: {aqi_now:.1f} | Forecast saved → {out_csv}")
 
-        all_now.append({
-            "StationId": st_id,
-            "StationName": s.get("StationName", ""),
-            "City": s.get("City", ""),
-            "AQI_Now": aqi_now,
-            "Datetime": datetime.now().isoformat()
-        })
+        all_now.append({"StationId": st_id, "StationName": s.get("StationName", ""), "City": s.get("City", ""), "AQI_Now": aqi_now, "Datetime": datetime.now().isoformat()})
 
         time.sleep(SLEEP_BETWEEN)
 
-    # SAVE SNAPSHOT (only once)
+    # snapshot
     if all_now:
         df_now = pd.DataFrame(all_now)
         snap_dir = os.path.join(PROJECT_BASE, "nowcast_snapshot")
         os.makedirs(snap_dir, exist_ok=True)
-
-        snapshot_path = os.path.join(
-            snap_dir,
-            f"nowcast_snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        )
+        snapshot_path = os.path.join(snap_dir, f"nowcast_snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
         df_now.to_csv(snapshot_path, index=False)
         print("Snapshot saved →", snapshot_path)
 
-
-    # BACKUP TO GOOGLE SHEETS (only once, after snapshot)
+    # backup (append-only)
     try:
-        backup_last_hour_rows()
+        backup_last_hour_rows_and_forecasts()
     except Exception as e:
         print("Backup Error:", e)
 
     print("Pipeline complete. History updated at:", HISTORY_FILE)
-
 
 
 if __name__ == "__main__":
